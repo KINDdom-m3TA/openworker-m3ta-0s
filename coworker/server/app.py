@@ -21,6 +21,8 @@ from typing import Any, Optional
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # Origins allowed to talk to the local sidecar. It binds to 127.0.0.1, but a page in the
 # user's own browser can still reach loopback — so without an origin gate, any website they
@@ -175,7 +177,11 @@ def create_app(manager: SessionManager) -> FastAPI:
             import traceback
 
             traceback.print_exc()
-        yield
+        # The mounted /mcp app (below) needs its StreamableHTTP session manager's own
+        # task group running for the lifetime of the server -- Starlette doesn't run a
+        # Mount's lifespan on its own, so we enter it here alongside everything else.
+        async with mcp_server.session_manager.run():
+            yield
         await manager.aclose()  # stop gateway + close MCP connections on shutdown
 
     app = FastAPI(title="coworker", version="0.0.0", lifespan=lifespan)
@@ -285,6 +291,77 @@ def create_app(manager: SessionManager) -> FastAPI:
             d["session_exists"] = rec is not None
             out.append(d)
         return {"items": out}
+
+    # --- MCP surface -----------------------------------------------------------------
+    # Exposes a read-only slice of this same control plane as MCP tools, mounted at /mcp
+    # (stateless HTTP -- one request per call, no server-held session across calls). Tools
+    # call the REST handlers above directly rather than re-implementing their logic, so
+    # there's exactly one code path for "list agents/personas/inbox/etc." whether the
+    # caller is the GUI, curl, or an MCP client. Gated by the same x-openworker-token
+    # middleware as everything else (middleware wraps the whole ASGI app, including Mounts).
+    mcp_server = FastMCP(
+        "openworker",
+        stateless_http=True,
+        streamable_http_path="/",
+        # The sidecar only ever binds loopback (--host/--port), but the actual bound
+        # port varies by flag/launch config -- match host on any port rather than
+        # hardcoding one, so this doesn't silently break if the port changes.
+        transport_security=TransportSecuritySettings(
+            allowed_hosts=["127.0.0.1:*", "localhost:*"],
+        ),
+    )
+
+    @mcp_server.tool()
+    def list_agents() -> dict[str, Any]:
+        """List every agent OpenWorker knows how to run."""
+        return agents()
+
+    @mcp_server.tool()
+    def list_personas() -> dict[str, Any]:
+        """List configured personas (agent + default workspace/connections presets)."""
+        return personas()
+
+    @mcp_server.tool()
+    def list_inbox(session_id: str = "", state: str = "") -> dict[str, Any]:
+        """List inbox items -- approvals and questions awaiting a response.
+
+        Args:
+            session_id: Restrict to one session; empty returns the cross-session inbox.
+            state: Filter by state (e.g. "pending"); empty returns all states.
+        """
+        return inbox(session_id=session_id, state=state)
+
+    @mcp_server.tool()
+    def list_connectors() -> list[dict[str, Any]]:
+        """List configured connectors (Slack, GitHub, HubSpot, Gmail, etc.) and their state."""
+        return manager.list_connectors()
+
+    @mcp_server.tool()
+    def list_mcp_servers() -> list[dict[str, Any]]:
+        """List MCP servers OpenWorker itself is configured to connect out to."""
+        return manager.list_mcp()
+
+    @mcp_server.tool()
+    def list_audit_log(
+        limit: int = 100,
+        session_id: str = "",
+        connector: str = "",
+        tool: str = "",
+    ) -> list[dict[str, Any]]:
+        """Query the tool/connector call audit log.
+
+        Args:
+            limit: Max entries to return.
+            session_id: Restrict to one session; empty returns all sessions.
+            connector: Restrict to one connector name; empty returns all.
+            tool: Restrict to one tool name; empty returns all.
+        """
+        return manager.list_audit(
+            limit=limit,
+            session_id=session_id or None,
+            connector=connector or None,
+            tool=tool or None,
+        )
 
     @app.post("/v1/inbox/{item_id}/resolve")
     async def resolve_inbox_item(item_id: str, body: dict) -> dict[str, Any]:
@@ -1930,6 +2007,11 @@ def create_app(manager: SessionManager) -> FastAPI:
             pass
         finally:
             manager.unregister_event_client(ws.send_json)
+
+    # Mounted last: Starlette matches routes in registration order, and a Mount matches
+    # any path under its prefix, so /mcp/oauth/callback (a specific route registered
+    # above) must be checked first or this would swallow it.
+    app.mount("/mcp", mcp_server.streamable_http_app())
 
     return app
 
